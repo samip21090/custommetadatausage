@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+"""
+Shared Salesforce client utilities for Task 1 and Task 2 scripts.
+
+Provides:
+  - SF CLI-based authentication (access token + instance URL)
+  - SOQL runner (standard and Tooling API)
+  - Direct REST GET for Tooling API (for compound fields like Flow.Metadata)
+  - File-based caching helpers
+  - Common formatting helpers
+"""
+
+import json
+import os
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from datetime import datetime
+
+# ── Default config ─────────────────────────────────────────────────────────────
+
+ORG_ALIAS   = "QA"
+API_VERSION = "59.0"
+
+
+# ── Authentication ─────────────────────────────────────────────────────────────
+
+def get_credentials(org_alias=ORG_ALIAS):
+    """
+    Retrieve access token and instance URL from SF CLI.
+    Exits the process on failure.
+    Returns (access_token, instance_url).
+    """
+    r = subprocess.run(
+        ["sf", "org", "display", "-o", org_alias, "--json"],
+        capture_output=True, text=True, timeout=30,
+    )
+    if r.returncode != 0:
+        print(f"ERROR: Cannot get org credentials for '{org_alias}': {r.stderr[:400]}")
+        sys.exit(1)
+
+    try:
+        d = json.loads(r.stdout)["result"]
+    except (KeyError, json.JSONDecodeError) as e:
+        print(f"ERROR: Unexpected response from sf org display: {e}")
+        sys.exit(1)
+
+    return d["accessToken"], d["instanceUrl"]
+
+
+# ── SOQL runner ───────────────────────────────────────────────────────────────
+
+def run_soql(query, org_alias=ORG_ALIAS, tooling=False):
+    """
+    Execute a SOQL query via SF CLI.
+    Returns a list of record dicts, or empty list on failure.
+    Uses --use-tooling-api flag when tooling=True.
+    """
+    args = ["sf", "data", "query", "--query", query, "-o", org_alias, "--json"]
+    if tooling:
+        args.append("--use-tooling-api")
+
+    r = subprocess.run(args, capture_output=True, text=True, timeout=300)
+
+    if r.returncode != 0:
+        # Non-zero return does not always mean total failure — SF CLI returns 1
+        # even for partial results in some cases. Try to parse anyway.
+        try:
+            parsed = json.loads(r.stdout)
+            records = parsed.get("result", {}).get("records", [])
+            if records:
+                return records
+        except Exception:
+            pass
+        return []
+
+    try:
+        return json.loads(r.stdout).get("result", {}).get("records", [])
+    except Exception:
+        return []
+
+
+def run_sf_cmd(args, cache_file, label):
+    """
+    Run an SF CLI command, writing stdout to cache_file.
+    Skips the call if cache_file already exists.
+    Returns True on success, False on failure.
+    """
+    if cache_file and os.path.exists(cache_file):
+        print(f"  [cache] {label}")
+        return True
+
+    print(f"  [fetch] {label} ...")
+    r = subprocess.run(args, capture_output=True, text=True, timeout=300)
+
+    if r.returncode != 0:
+        print(f"  ERROR ({label}): {r.stderr[:400]}")
+        return False
+
+    if cache_file:
+        os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+        with open(cache_file, "w") as f:
+            f.write(r.stdout)
+
+    print(f"         done.")
+    return True
+
+
+# ── Direct REST API ───────────────────────────────────────────────────────────
+
+def tooling_rest_get(path, access_token, instance_url):
+    """
+    Make a GET request to the Tooling REST API.
+    Used for endpoints that return compound fields (e.g. Flow.Metadata)
+    that are not available via SOQL.
+    Returns the parsed JSON dict, or None on failure.
+    """
+    url = f"{instance_url}/services/data/v{API_VERSION}/tooling/{path}"
+    req = urllib.request.Request(
+        url,
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")[:200]
+        print(f"  WARN tooling REST GET failed [{e.code}] ({path}): {body}")
+        return None
+    except Exception as e:
+        print(f"  WARN tooling REST GET failed ({path}): {e}")
+        return None
+
+
+def rest_get(path, access_token, instance_url):
+    """
+    Make a GET request to the standard Salesforce REST API.
+    Returns the parsed JSON dict, or None on failure.
+    """
+    url = f"{instance_url}/services/data/v{API_VERSION}/{path}"
+    req = urllib.request.Request(
+        url,
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        print(f"  WARN REST GET failed [{e.code}] ({path})")
+        return None
+    except Exception as e:
+        print(f"  WARN REST GET failed ({path}): {e}")
+        return None
+
+
+# ── Caching helpers ───────────────────────────────────────────────────────────
+
+def load_json(path):
+    """Load and return JSON from a file. Raises if file does not exist."""
+    with open(path) as f:
+        return json.load(f)
+
+
+def load_cache(cache_dir, name):
+    """
+    Load a named JSON cache file from cache_dir.
+    Returns the parsed data, or None if the cache does not exist.
+    """
+    path = os.path.join(cache_dir, f"{name}.json")
+    if os.path.exists(path):
+        print(f"  [cache] {name}")
+        with open(path) as f:
+            return json.load(f)
+    return None
+
+
+def save_cache(cache_dir, name, data):
+    """Save data as a named JSON cache file in cache_dir."""
+    os.makedirs(cache_dir, exist_ok=True)
+    path = os.path.join(cache_dir, f"{name}.json")
+    with open(path, "w") as f:
+        json.dump(data, f)
+
+
+# ── Formatting helpers ────────────────────────────────────────────────────────
+
+def fmt_date(iso_str):
+    """Convert ISO datetime string to YYYY-MM-DD. Returns empty string on failure."""
+    if not iso_str:
+        return ""
+    try:
+        return datetime.fromisoformat(
+            iso_str.replace("Z", "+00:00")
+        ).strftime("%Y-%m-%d")
+    except Exception:
+        return iso_str[:10]
