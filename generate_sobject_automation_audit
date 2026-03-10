@@ -1,0 +1,1183 @@
+#!/usr/bin/env python3
+"""
+Generic SObject Automation Audit — field metadata + automation analysis for any SObject.
+
+For every field on the target SObject, captures:
+  - Full field metadata (type, picklist values, behavior, formula, default, encryption,
+    reporting availability, population rate, created/modified dates)
+  - Which active Apex Triggers reference the field (read or write)
+  - Which active Flows reference the field (entry criteria, read, write)
+  - Which Validation Rules reference the field
+  - Which Workflow Field Updates target the field
+  - Whether the field is SET (written) by any automation
+
+Automation analysis is scoped purely to the target SObject — no cross-object
+(Account / Contact / Opportunity) filtering is applied.
+
+Usage:
+  python3 scripts/generate_sobject_automation_audit.py <ObjectApiName> <OrgAlias> <OutputExcel>
+
+Examples:
+  python3 scripts/generate_sobject_automation_audit.py Account ComdataProd scripts/Account_Automation_Audit.xlsx
+  python3 scripts/generate_sobject_automation_audit.py MultiCard_Setup__c ComdataProd scripts/MultiCard_Audit.xlsx
+
+Output: Excel file with one sheet containing all fields + automation details.
+Cache:  /tmp/soauto_<OrgAlias>_<ObjectApiName>/ — delete to force refresh.
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from collections import defaultdict
+
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
+
+sys.path.insert(0, os.path.dirname(__file__))
+from sf_client import (
+    get_credentials,
+    load_cache,
+    run_soql,
+    save_cache,
+    tooling_rest_get,
+)
+
+# ── CLI Parameters ─────────────────────────────────────────────────────────────
+
+if len(sys.argv) < 4:
+    print("Usage: python3 generate_sobject_automation_audit.py <ObjectApiName> <OrgAlias> <OutputExcel>")
+    print("Example: python3 generate_sobject_automation_audit.py Account ComdataProd scripts/Account_Audit.xlsx")
+    sys.exit(1)
+
+OBJECT_NAME = sys.argv[1]
+ORG_ALIAS   = sys.argv[2]
+OUTPUT_XLSX = sys.argv[3]
+
+BATCH_SIZE = 20
+# Include org alias in cache dir to prevent cross-org cache pollution
+CACHE_DIR  = os.path.join(tempfile.gettempdir(), f"soauto_{ORG_ALIAS}_{OBJECT_NAME}")
+
+# ── Excel columns ──────────────────────────────────────────────────────────────
+
+HEADERS = [
+    # Field Metadata
+    "Field Label",
+    "Field API Name",
+    "Data Type",
+    "Field Values",
+    "Behavior",
+    "Standard or Custom",
+    "Has Default Value",
+    "Is Formula Field",
+    "Is Encrypted",
+    "Available for Reporting",
+    "Population Rate",
+    "Field Created Date",
+    "Field Last Modified Date",
+    # Automation
+    "Workflow Rule Dependencies",
+    "Is used in Trigger (Y/N)",
+    "Trigger Name",
+    "Trigger Logic / Criteria",
+    "Is used in Apex Class (Y/N)",
+    "Apex Class Name",
+    "Apex Class Logic / Notes",
+    "Is used in Flow (Y/N)",
+    "Flow Name",
+    "Flow Criteria / Entry Conditions",
+    "Is used in Validation Rule (Y/N)",
+    "Validation Rule Name",
+    "Validation Logic",
+    "Is Set by Automation (Y/N)",
+]
+
+# ── Excel styling ──────────────────────────────────────────────────────────────
+
+HEADER_FILL = PatternFill("solid", fgColor="1F4E79")
+HEADER_FONT = Font(bold=True, color="FFFFFF", size=10)
+ALT_FILL    = PatternFill("solid", fgColor="EBF3FB")
+
+# ── Flow operator display map ──────────────────────────────────────────────────
+
+OPERATOR_MAP = {
+    "EqualTo":              "=",
+    "NotEqualTo":           "!=",
+    "GreaterThan":          ">",
+    "LessThan":             "<",
+    "GreaterThanOrEqualTo": ">=",
+    "LessThanOrEqualTo":    "<=",
+    "IsNull":               "is null",
+    "IsNotNull":            "is not null",
+    "Contains":             "contains",
+    "StartsWith":           "starts with",
+    "EndsWith":             "ends with",
+    "WasSet":               "was set",
+    "WasNotSet":            "was not set",
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 1 — FIELD METADATA
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fmt_date(iso_str):
+    from datetime import datetime
+    if not iso_str:
+        return ""
+    try:
+        return datetime.fromisoformat(iso_str.replace("Z", "+00:00")).strftime("%Y-%m-%d")
+    except Exception:
+        return iso_str[:10]
+
+
+def fetch_entity_id():
+    cached = load_cache(CACHE_DIR, f"entity_id_{OBJECT_NAME}")
+    if cached is not None:
+        return cached.get("id")
+
+    records = run_soql(
+        f"SELECT Id, DurableId, QualifiedApiName FROM EntityDefinition "
+        f"WHERE QualifiedApiName = '{OBJECT_NAME}'",
+        org_alias=ORG_ALIAS,
+        tooling=True,
+    )
+    # EntityDefinition.Id is always '000000000000000AAA' (Salesforce virtual table quirk).
+    # DurableId is the real identifier (e.g. '01Ixxxx...' for custom objects).
+    entity_id = None
+    if records:
+        durable = records[0].get("DurableId") or ""
+        raw_id  = records[0].get("Id") or ""
+        entity_id = durable if (durable and durable != "000000000000000AAA") else (
+                    raw_id  if (raw_id  and raw_id  != "000000000000000AAA") else None)
+    save_cache(CACHE_DIR, f"entity_id_{OBJECT_NAME}", {"id": entity_id})
+    return entity_id
+
+
+def fetch_field_definitions():
+    cached = load_cache(CACHE_DIR, f"fd_{OBJECT_NAME}")
+    if cached is not None:
+        return cached
+
+    print(f"  [fetch] FieldDefinition for {OBJECT_NAME} ...")
+    records = run_soql(
+        f"SELECT QualifiedApiName, Label, DataType, IsNillable, "
+        f"IsCalculated, IsApiFilterable, LastModifiedDate "
+        f"FROM FieldDefinition "
+        f"WHERE EntityDefinition.QualifiedApiName = '{OBJECT_NAME}' "
+        f"ORDER BY Label ASC LIMIT 1000",
+        org_alias=ORG_ALIAS,
+        tooling=True,
+    )
+
+    result = {}
+    for r in records:
+        api = r["QualifiedApiName"]
+        result[api] = {
+            "label":            r.get("Label") or api,
+            "dataType":         r.get("DataType") or "Unknown",
+            "isNillable":       r.get("IsNillable", True),
+            "isCalculated":     r.get("IsCalculated", False),
+            "isApiFilterable":  r.get("IsApiFilterable", False),
+            "lastModifiedDate": r.get("LastModifiedDate", ""),
+        }
+
+    save_cache(CACHE_DIR, f"fd_{OBJECT_NAME}", result)
+    print(f"         {len(result)} fields")
+    return result
+
+
+def fetch_custom_field_dates():
+    """Fetch CreatedDate and LastModifiedDate for custom fields via Tooling API."""
+    cached = load_cache(CACHE_DIR, f"cf_{OBJECT_NAME}")
+    if cached is not None:
+        return cached
+
+    print(f"  [fetch] CustomField dates for {OBJECT_NAME} ...")
+
+    def _query(table_enum_or_id):
+        return run_soql(
+            f"SELECT DeveloperName, NamespacePrefix, CreatedDate, LastModifiedDate "
+            f"FROM CustomField "
+            f"WHERE TableEnumOrId = '{table_enum_or_id}' "
+            f"LIMIT 2000",
+            org_alias=ORG_ALIAS,
+            tooling=True,
+        )
+
+    records = _query(OBJECT_NAME)
+    if not records and OBJECT_NAME.endswith("__c"):
+        entity_id = fetch_entity_id()
+        if entity_id:
+            records = _query(entity_id)
+
+    result = {}
+    for r in records:
+        dev = r.get("DeveloperName", "")
+        ns  = r.get("NamespacePrefix") or ""
+        api = f"{ns}__{dev}__c" if ns else f"{dev}__c"
+        result[api] = {
+            "created":  fmt_date(r.get("CreatedDate", "")),
+            "modified": fmt_date(r.get("LastModifiedDate", "")),
+        }
+
+    save_cache(CACHE_DIR, f"cf_{OBJECT_NAME}", result)
+    print(f"         {len(result)} custom field date records")
+    return result
+
+
+def fetch_describe():
+    cached = load_cache(CACHE_DIR, f"desc_{OBJECT_NAME}")
+    if cached is not None:
+        return cached
+
+    print(f"  [fetch] sobject describe for {OBJECT_NAME} ...")
+    r = subprocess.run(
+        ["sf", "sobject", "describe", "-s", OBJECT_NAME, "-o", ORG_ALIAS, "--json"],
+        capture_output=True, text=True, timeout=300,
+    )
+    if r.returncode != 0:
+        print(f"  ERROR describing {OBJECT_NAME}: {r.stderr[:400]}")
+        return {}
+
+    try:
+        fields = {f["name"]: f for f in json.loads(r.stdout)["result"]["fields"]}
+    except (KeyError, json.JSONDecodeError) as e:
+        print(f"  ERROR parsing describe for {OBJECT_NAME}: {e}")
+        return {}
+
+    save_cache(CACHE_DIR, f"desc_{OBJECT_NAME}", fields)
+    print(f"         {len(fields)} fields from describe")
+    return fields
+
+
+def fetch_population_rates(desc_index):
+    print(f"\n  [fetch] Population rates for {OBJECT_NAME} ...")
+
+    result = run_soql(f"SELECT COUNT() FROM {OBJECT_NAME}", org_alias=ORG_ALIAS)
+    if not result or not (result[0].get("expr0") if result else None):
+        # COUNT() without GROUP BY returns totalSize not records
+        # Try a different approach
+        args = [
+            "sf", "data", "query", "--query", f"SELECT COUNT() FROM {OBJECT_NAME}",
+            "-o", ORG_ALIAS, "--json",
+        ]
+        r = subprocess.run(args, capture_output=True, text=True, timeout=300)
+        try:
+            total = json.loads(r.stdout).get("result", {}).get("totalSize", 0)
+        except Exception:
+            total = 0
+    else:
+        total = 0
+
+    if not total:
+        # One more attempt using COUNT(Id)
+        count_records = run_soql(
+            f"SELECT COUNT(Id) cnt FROM {OBJECT_NAME}",
+            org_alias=ORG_ALIAS,
+        )
+        total = count_records[0].get("cnt", 0) if count_records else 0
+
+    if not total:
+        print("  Could not get total record count — skipping population rates.")
+        return {}
+
+    print(f"  Total {OBJECT_NAME} records: {total:,}")
+
+    filterable = [name for name, f in desc_index.items() if f.get("filterable", False)]
+    print(f"  Filterable fields to measure: {len(filterable)}")
+
+    rates = {}
+    batches = [filterable[i:i + BATCH_SIZE] for i in range(0, len(filterable), BATCH_SIZE)]
+
+    for idx, batch in enumerate(batches, 1):
+        exprs  = ", ".join(f"COUNT({f})" for f in batch)
+        result = run_soql(
+            f"SELECT {exprs} FROM {OBJECT_NAME}",
+            org_alias=ORG_ALIAS,
+        )
+
+        if result and result[0]:
+            rec = result[0]
+            for i, field_name in enumerate(batch):
+                count_val = rec.get(f"expr{i}") or 0
+                rates[field_name] = f"{count_val / total * 100:.1f}%" if total else "N/A"
+        else:
+            for field_name in batch:
+                single = run_soql(
+                    f"SELECT COUNT({field_name}) FROM {OBJECT_NAME}",
+                    org_alias=ORG_ALIAS,
+                )
+                if single and single[0]:
+                    count_val = single[0].get("expr0") or 0
+                    rates[field_name] = f"{count_val / total * 100:.1f}%" if total else "N/A"
+                else:
+                    rates[field_name] = "N/A"
+
+        if idx % 5 == 0 or idx == len(batches):
+            print(f"  Progress: {idx}/{len(batches)} batches done")
+
+    return rates
+
+
+def merge_field_metadata():
+    """
+    Combine FieldDefinition + sobject describe + CustomField dates
+    into a unified field dict keyed by API name.
+    """
+    fd_records  = fetch_field_definitions()
+    desc_index  = fetch_describe()
+    cf_index    = fetch_custom_field_dates()
+    pop_rates   = fetch_population_rates(desc_index)
+
+    merged = {}
+    for api, fd_rec in fd_records.items():
+        desc_rec = desc_index.get(api, {})
+        is_custom = api.endswith("__c")
+
+        # Picklist values
+        field_values = ""
+        if desc_rec.get("type") in ("picklist", "multipicklist"):
+            vals = [
+                pv["label"]
+                for pv in desc_rec.get("picklistValues", [])
+                if pv.get("active", True)
+            ]
+            field_values = "; ".join(vals)
+
+        # Behavior
+        if desc_rec:
+            if not desc_rec.get("createable") and not desc_rec.get("updateable"):
+                behavior = "System (Read Only)"
+            elif not desc_rec.get("nillable", True):
+                behavior = "Required"
+            else:
+                behavior = "Optional"
+        else:
+            behavior = "Required" if not fd_rec.get("isNillable", True) else "Optional"
+
+        # Has Default Value
+        raw_default = desc_rec.get("defaultValue")
+        has_default = (raw_default is not None) or bool(desc_rec.get("defaultValueFormula"))
+
+        # Is Formula
+        is_formula = bool(fd_rec.get("isCalculated") or desc_rec.get("calculated", False))
+
+        # Is Encrypted
+        is_encrypted = bool(desc_rec.get("encrypted", False))
+
+        # Available for Reporting
+        is_reportable = bool(
+            fd_rec.get("isApiFilterable") or desc_rec.get("filterable", False)
+        )
+
+        # Dates
+        if is_custom:
+            cf = cf_index.get(api, {})
+            created_date  = cf.get("created", "")
+            modified_date = cf.get("modified", "") or fmt_date(fd_rec.get("lastModifiedDate", ""))
+        else:
+            created_date  = "N/A (Standard Field)"
+            modified_date = fmt_date(fd_rec.get("lastModifiedDate", ""))
+
+        merged[api] = {
+            "label":        fd_rec.get("label") or api,
+            "dataType":     fd_rec.get("dataType") or desc_rec.get("type", "Unknown"),
+            "fieldValues":  field_values,
+            "behavior":     behavior,
+            "isCustom":     is_custom,
+            "hasDefault":   has_default,
+            "isFormula":    is_formula,
+            "isEncrypted":  is_encrypted,
+            "isReportable": is_reportable,
+            "popRate":      pop_rates.get(api, "N/A"),
+            "createdDate":  created_date,
+            "modifiedDate": modified_date,
+        }
+
+    return merged, desc_index
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 2 — APEX TRIGGER ANALYSIS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fetch_triggers(token, inst_url):
+    cached = load_cache(CACHE_DIR, f"triggers_{OBJECT_NAME}")
+    if cached is not None:
+        return cached
+
+    print(f"  [fetch] Apex triggers for {OBJECT_NAME} ...")
+    # Query metadata only (no Body in SELECT — Tooling SOQL Body can return '(hidden)')
+    records = run_soql(
+        f"SELECT Id, Name, TableEnumOrId, Status, "
+        f"UsageBeforeInsert, UsageAfterInsert, "
+        f"UsageBeforeUpdate, UsageAfterUpdate, "
+        f"UsageBeforeDelete, UsageAfterDelete, "
+        f"UsageAfterUndelete "
+        f"FROM ApexTrigger "
+        f"WHERE TableEnumOrId = '{OBJECT_NAME}' AND Status = 'Active' "
+        f"LIMIT 100",
+        org_alias=ORG_ALIAS,
+        tooling=True,
+    )
+
+    # Fetch body via REST per trigger — REST returns actual body even when SOQL shows '(hidden)'
+    print(f"         {len(records)} triggers — fetching bodies via REST ...")
+    enriched = []
+    for r in records:
+        data = tooling_rest_get(f"sobjects/ApexTrigger/{r['Id']}", token, inst_url)
+        r["Body"] = (data.get("Body") or "") if data else ""
+        enriched.append(r)
+
+    save_cache(CACHE_DIR, f"triggers_{OBJECT_NAME}", enriched)
+    print(f"         done.")
+    return enriched
+
+
+def _trigger_events_str(trigger):
+    events = []
+    if trigger.get("UsageBeforeInsert"):  events.append("before insert")
+    if trigger.get("UsageAfterInsert"):   events.append("after insert")
+    if trigger.get("UsageBeforeUpdate"):  events.append("before update")
+    if trigger.get("UsageAfterUpdate"):   events.append("after update")
+    if trigger.get("UsageBeforeDelete"):  events.append("before delete")
+    if trigger.get("UsageAfterDelete"):   events.append("after delete")
+    if trigger.get("UsageAfterUndelete"): events.append("after undelete")
+    return ", ".join(events) if events else "unknown events"
+
+
+def _find_fields_in_apex(body, field_api_names):
+    found = set()
+    for field in field_api_names:
+        pattern = re.compile(
+            rf'(?:'
+            rf'\.\s*{re.escape(field)}\b'
+            rf'|(?:SELECT|,)\s+{re.escape(field)}\b'
+            rf'|\b{re.escape(field)}\s*='
+            rf')',
+            re.IGNORECASE,
+        )
+        if pattern.search(body):
+            found.add(field)
+    return found
+
+
+def _field_is_written_in_apex(body, field):
+    set_pattern = re.compile(
+        rf'\.\s*{re.escape(field)}\s*=(?!=)',
+        re.IGNORECASE,
+    )
+    return bool(set_pattern.search(body))
+
+
+def analyze_triggers(field_api_names, token, inst_url):
+    """
+    Returns dict: field_api_name -> {
+        trigger_names: [str],
+        criteria_notes: [str],
+        is_set: bool,
+    }
+    """
+    triggers = fetch_triggers(token, inst_url)
+
+    field_info = defaultdict(lambda: {
+        "trigger_names":  [],
+        "criteria_notes": [],
+        "is_set":         False,
+    })
+
+    for trigger in triggers:
+        name      = trigger.get("Name", "")
+        body      = trigger.get("Body") or ""
+        if not body or body.strip() == "(hidden)":
+            continue
+
+        events_str   = _trigger_events_str(trigger)
+        fields_found = _find_fields_in_apex(body, field_api_names)
+
+        for field in fields_found:
+            info = field_info[field]
+            info["trigger_names"].append(name)
+
+            is_written = _field_is_written_in_apex(body, field)
+            if is_written:
+                info["is_set"] = True
+                action = "writes"
+            else:
+                action = "reads"
+
+            info["criteria_notes"].append(f"{name} ({events_str}) — {action} field")
+
+    return dict(field_info)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 3 — APEX CLASS ANALYSIS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fetch_apex_classes(token, inst_url):
+    cached = load_cache(CACHE_DIR, f"apexclasses_{OBJECT_NAME}")
+    if cached is not None:
+        return cached
+
+    print(f"  [fetch] Apex classes referencing {OBJECT_NAME} ...")
+
+    # Step 1: Try the fast path — Body LIKE in SOQL (works for unmanaged classes only;
+    # managed classes have Body='(hidden)' so they never match the LIKE filter)
+    records = run_soql(
+        f"SELECT Id, Name, Body FROM ApexClass "
+        f"WHERE Status = 'Active' AND Body LIKE '%{OBJECT_NAME}%' "
+        f"LIMIT 500",
+        org_alias=ORG_ALIAS,
+        tooling=True,
+    )
+    print(f"         {len(records)} classes matched via SOQL LIKE")
+
+    # Step 2: Also fetch all active unmanaged classes via REST to catch any that
+    # were missed (e.g. if SOQL Body LIKE silently returned 0 due to hidden bodies)
+    all_unmanaged = run_soql(
+        f"SELECT Id, Name FROM ApexClass "
+        f"WHERE Status = 'Active' AND NamespacePrefix = null "
+        f"LIMIT 500",
+        org_alias=ORG_ALIAS,
+        tooling=True,
+    )
+    already_found = {r["Id"] for r in records}
+    remaining = [r for r in all_unmanaged if r["Id"] not in already_found]
+
+    if remaining:
+        print(f"         Checking {len(remaining)} additional unmanaged classes via REST ...")
+        for r in remaining:
+            data = tooling_rest_get(f"sobjects/ApexClass/{r['Id']}", token, inst_url)
+            body = (data.get("Body") or "") if data else ""
+            if body and body.strip() != "(hidden)" and OBJECT_NAME.lower() in body.lower():
+                r["Body"] = body
+                records.append(r)
+
+    # Ensure every record has a Body key (SOQL results already have it)
+    for r in records:
+        if "Body" not in r:
+            r["Body"] = ""
+
+    save_cache(CACHE_DIR, f"apexclasses_{OBJECT_NAME}", records)
+    print(f"         {len(records)} apex classes reference {OBJECT_NAME}")
+    return records
+
+
+def analyze_apex_classes(field_api_names, token, inst_url):
+    """
+    Returns dict: field_api_name -> {
+        class_names: [str],
+        criteria_notes: [str],
+        is_set: bool,
+    }
+    """
+    classes = fetch_apex_classes(token, inst_url)
+
+    field_info = defaultdict(lambda: {
+        "class_names":    [],
+        "criteria_notes": [],
+        "is_set":         False,
+    })
+
+    for cls in classes:
+        name = cls.get("Name", "")
+        body = cls.get("Body") or ""
+        if not body or body.strip() == "(hidden)":
+            continue
+
+        fields_found = _find_fields_in_apex(body, field_api_names)
+
+        for field in fields_found:
+            info = field_info[field]
+            info["class_names"].append(name)
+
+            is_written = _field_is_written_in_apex(body, field)
+            if is_written:
+                info["is_set"] = True
+                action = "writes"
+            else:
+                action = "reads"
+
+            info["criteria_notes"].append(f"{name} (Apex Class) — {action} field")
+
+    return dict(field_info)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 4 — FLOW ANALYSIS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _safe_list(val):
+    if val is None:           return []
+    if isinstance(val, list): return val
+    if isinstance(val, dict): return [val]
+    return []
+
+
+def fetch_all_active_flows():
+    cached = load_cache(CACHE_DIR, "flows_basic_all")
+    if cached is not None:
+        return cached
+
+    print(f"  [fetch] All active flows (org-wide) ...")
+    records = run_soql(
+        "SELECT Id, MasterLabel, ProcessType, Status "
+        "FROM Flow WHERE Status = 'Active' LIMIT 2000",
+        org_alias=ORG_ALIAS,
+        tooling=True,
+    )
+
+    save_cache(CACHE_DIR, "flows_basic_all", records)
+    print(f"         {len(records)} active flows found")
+    return records
+
+
+def fetch_flow_metadata(flow_id, token, inst_url):
+    cached = load_cache(CACHE_DIR, f"flow_meta_{flow_id}")
+    if cached is not None:
+        return cached
+
+    data = tooling_rest_get(f"sobjects/Flow/{flow_id}", token, inst_url)
+    if not data:
+        return None
+
+    metadata = data.get("Metadata")
+    if metadata is None:
+        return None
+
+    save_cache(CACHE_DIR, f"flow_meta_{flow_id}", metadata)
+    return metadata
+
+
+def _flow_involves_obj(metadata):
+    if not metadata:
+        return False
+    start = metadata.get("start") or {}
+    if start.get("object") == OBJECT_NAME:
+        return True
+    for key in ("recordLookups", "recordUpdates", "recordCreates", "recordDeletes"):
+        for op in _safe_list(metadata.get(key)):
+            if op.get("object") == OBJECT_NAME:
+                return True
+    return False
+
+
+def _flow_entry_conditions_str(metadata):
+    start   = metadata.get("start") or {}
+    filters = _safe_list(start.get("filters"))
+
+    if not filters:
+        trigger_type   = start.get("triggerType", "")
+        record_trigger = start.get("recordTriggerType", "")
+        parts = []
+        if trigger_type:
+            parts.append(f"Trigger: {trigger_type}")
+        if record_trigger:
+            parts.append(f"On: {record_trigger}")
+        return "; ".join(parts)
+
+    parts = []
+    for f in filters:
+        field    = f.get("field", "")
+        operator = OPERATOR_MAP.get(f.get("operator", ""), f.get("operator", ""))
+        val      = f.get("value") or {}
+        if isinstance(val, dict):
+            value = (
+                val.get("stringValue")
+                or val.get("numberValue")
+                or val.get("booleanValue")
+                or val.get("elementReference")
+                or ""
+            )
+        else:
+            value = str(val)
+        parts.append(f"{field} {operator} '{value}'" if value else f"{field} {operator}")
+
+    logic  = start.get("filterLogic", "")
+    result = " | ".join(parts)
+    if logic and logic not in ("AND", ""):
+        result = f"Logic: {logic} | " + result
+    return result
+
+
+def _find_fields_in_flow_metadata(metadata, field_api_names):
+    """
+    Returns dict: field_api_name -> {is_read: bool, is_written: bool}
+    """
+    field_names_lower = {f.lower(): f for f in field_api_names}
+    result = defaultdict(lambda: {"is_read": False, "is_written": False})
+
+    # Entry criteria filters
+    start = metadata.get("start") or {}
+    for flt in _safe_list(start.get("filters")):
+        field = (flt.get("field") or "").lower()
+        if field in field_names_lower:
+            result[field_names_lower[field]]["is_read"] = True
+
+    # Record Lookups (reads)
+    for rl in _safe_list(metadata.get("recordLookups")):
+        if rl.get("object") != OBJECT_NAME:
+            continue
+        for f in _safe_list(rl.get("queriedFields")):
+            fl = (f or "").lower()
+            if fl in field_names_lower:
+                result[field_names_lower[fl]]["is_read"] = True
+        for oa in _safe_list(rl.get("outputAssignments")):
+            fl = (oa.get("field") or "").lower()
+            if fl in field_names_lower:
+                result[field_names_lower[fl]]["is_read"] = True
+
+    # Record Updates + Creates (writes)
+    for op_list in [
+        _safe_list(metadata.get("recordUpdates")),
+        _safe_list(metadata.get("recordCreates")),
+    ]:
+        for op in op_list:
+            if op.get("object") != OBJECT_NAME:
+                continue
+            for ia in _safe_list(op.get("inputAssignments")):
+                fl = (ia.get("field") or "").lower()
+                if fl in field_names_lower:
+                    result[field_names_lower[fl]]["is_written"] = True
+
+    # Decision conditions (reads in if/else logic)
+    for dec in _safe_list(metadata.get("decisions")):
+        for rule in _safe_list(dec.get("rules")):
+            for cond in _safe_list(rule.get("conditions")):
+                lv = cond.get("leftValueReference") or ""
+                for field in field_api_names:
+                    if field.lower() in lv.lower():
+                        result[field]["is_read"] = True
+
+    return dict(result)
+
+
+def analyze_flows(field_api_names, token, inst_url):
+    """
+    Returns dict: field_api_name -> {
+        flow_names: [str],
+        entry_conditions: [str],
+        criteria_notes: [str],
+        is_set: bool,
+    }
+    """
+    all_flows = fetch_all_active_flows()
+
+    field_info = defaultdict(lambda: {
+        "flow_names":       [],
+        "entry_conditions": [],
+        "criteria_notes":   [],
+        "is_set":           False,
+    })
+
+    relevant_count = 0
+    total_flows    = len(all_flows)
+
+    for i, flow in enumerate(all_flows, 1):
+        flow_id    = flow["Id"]
+        flow_label = flow.get("MasterLabel", flow_id)
+
+        if i % 50 == 0:
+            print(f"    Flow scan: {i}/{total_flows} checked, {relevant_count} relevant so far")
+
+        metadata = fetch_flow_metadata(flow_id, token, inst_url)
+        if not metadata:
+            continue
+
+        if not _flow_involves_obj(metadata):
+            continue
+
+        relevant_count += 1
+        field_usage  = _find_fields_in_flow_metadata(metadata, field_api_names)
+        entry_conds  = _flow_entry_conditions_str(metadata)
+
+        for field, usage in field_usage.items():
+            if not (usage["is_read"] or usage["is_written"]):
+                continue
+
+            info = field_info[field]
+            info["flow_names"].append(flow_label)
+            info["entry_conditions"].append(entry_conds)
+
+            if usage["is_written"]:
+                info["is_set"] = True
+                action = "set by flow"
+            else:
+                action = "read by flow"
+
+            note = f"{flow_label} ({action})"
+            if entry_conds:
+                note += f" | Entry: {entry_conds}"
+            info["criteria_notes"].append(note)
+
+    print(f"    Flows relevant to {OBJECT_NAME}: {relevant_count} of {total_flows}")
+    return dict(field_info)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 5 — VALIDATION RULE ANALYSIS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fetch_validation_rules(token, inst_url):
+    cached = load_cache(CACHE_DIR, f"vr_{OBJECT_NAME}")
+    if cached is not None:
+        return cached
+
+    print(f"  [fetch] Validation rules for {OBJECT_NAME} ...")
+
+    # Use relationship query — avoids EntityDefinitionId altogether (EntityDefinition.Id
+    # returns 000000000000000AAA for custom objects, making the ID approach unreliable).
+    # Fetch ALL VRs (active + inactive) so we don't silently miss ones where the Tooling
+    # API disagrees with the UI on Active status; filter to active in Python.
+    records = run_soql(
+        f"SELECT Id, ValidationName, Active, ErrorDisplayField "
+        f"FROM ValidationRule "
+        f"WHERE EntityDefinition.QualifiedApiName = '{OBJECT_NAME}' "
+        f"LIMIT 200",
+        org_alias=ORG_ALIAS,
+        tooling=True,
+    )
+    all_count = len(records)
+    records = [r for r in records if r.get("Active")]
+    print(f"         {all_count} total, {len(records)} active")
+
+    enriched = []
+    for r in records:
+        vr_id = r["Id"]
+        data  = tooling_rest_get(
+            f"sobjects/ValidationRule/{vr_id}?fields=Metadata", token, inst_url
+        )
+        formula = ""
+        if data and isinstance(data.get("Metadata"), dict):
+            formula = data["Metadata"].get("errorConditionFormula") or ""
+        r["ErrorConditionFormula"] = formula
+        enriched.append(r)
+
+    print(f"         {len(enriched)} active validation rules — formulas fetched")
+
+    save_cache(CACHE_DIR, f"vr_{OBJECT_NAME}", enriched)
+    print(f"         done.")
+    return enriched
+
+
+def analyze_validation_rules(field_api_names, token, inst_url):
+    """
+    Returns dict: field_api_name -> {
+        vr_names: [str],
+        vr_formulas: [str],
+    }
+    """
+    vr_records = fetch_validation_rules(token, inst_url)
+
+    field_info = defaultdict(lambda: {"vr_names": [], "vr_formulas": []})
+
+    for vr in vr_records:
+        name    = vr.get("ValidationName", "")
+        formula = vr.get("ErrorConditionFormula") or ""
+
+        # Find matching fields
+        for field in field_api_names:
+            if re.search(rf'\b{re.escape(field)}\b', formula, re.IGNORECASE):
+                info    = field_info[field]
+                snippet = formula if len(formula) <= 200 else formula[:200] + "..."
+                info["vr_names"].append(name)
+                info["vr_formulas"].append(f"{name}: {snippet}")
+
+    return dict(field_info)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 6 — WORKFLOW FIELD UPDATE ANALYSIS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fetch_workflow_dependencies():
+    cached = load_cache(CACHE_DIR, f"wf_{OBJECT_NAME}")
+    if cached is not None:
+        return cached
+
+    print(f"  [fetch] Workflow field updates for {OBJECT_NAME} ...")
+
+    records = run_soql(
+        f"SELECT Id, Name, TableEnumOrId, FieldApiName, Formula "
+        f"FROM WorkflowFieldUpdate "
+        f"WHERE TableEnumOrId = '{OBJECT_NAME}' "
+        f"LIMIT 500",
+        org_alias=ORG_ALIAS,
+        tooling=True,
+    )
+
+    if not records and OBJECT_NAME.endswith("__c"):
+        entity_id = fetch_entity_id()
+        if entity_id:
+            records = run_soql(
+                f"SELECT Id, Name, TableEnumOrId, FieldApiName, Formula "
+                f"FROM WorkflowFieldUpdate "
+                f"WHERE TableEnumOrId = '{entity_id}' "
+                f"LIMIT 500",
+                org_alias=ORG_ALIAS,
+                tooling=True,
+            )
+
+    print(f"         {len(records)} workflow field updates")
+
+    result = defaultdict(lambda: {"wf_names": [], "is_set": False})
+    for r in records:
+        field = r.get("FieldApiName", "")
+        name  = r.get("Name", "")
+        if field:
+            result[field]["wf_names"].append(name)
+            result[field]["is_set"] = True
+
+    final = {k: dict(v) for k, v in result.items()}
+    save_cache(CACHE_DIR, f"wf_{OBJECT_NAME}", final)
+    return final
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 7 — BUILD OUTPUT ROWS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _yesno(val):
+    return "Y" if val else "N"
+
+
+def build_rows(merged_fields, trigger_analysis, apex_class_analysis, flow_analysis, vr_analysis, wf_analysis):
+    rows = []
+
+    for api_name, meta in sorted(
+        merged_fields.items(),
+        key=lambda x: (x[1].get("label") or x[0]).lower(),
+    ):
+        trig  = trigger_analysis.get(api_name, {})
+        cls   = apex_class_analysis.get(api_name, {})
+        flow  = flow_analysis.get(api_name, {})
+        vr    = vr_analysis.get(api_name, {})
+        wf    = wf_analysis.get(api_name, {})
+
+        # Trigger
+        trig_names    = trig.get("trigger_names", [])
+        trig_notes    = trig.get("criteria_notes", [])
+        trig_is_set   = trig.get("is_set", False)
+
+        # Apex Class
+        cls_names     = cls.get("class_names", [])
+        cls_notes     = cls.get("criteria_notes", [])
+        cls_is_set    = cls.get("is_set", False)
+
+        # Flow
+        flow_names    = flow.get("flow_names", [])
+        flow_notes    = flow.get("criteria_notes", [])
+        flow_is_set   = flow.get("is_set", False)
+
+        # Validation Rule
+        vr_names      = vr.get("vr_names", [])
+        vr_formulas   = vr.get("vr_formulas", [])
+
+        # Workflow
+        wf_names      = wf.get("wf_names", [])
+        wf_is_set     = wf.get("is_set", False)
+
+        # Is Set by Automation
+        set_by = []
+        if trig_is_set:
+            for n in trig_names:
+                set_by.append(f"{n} (Apex Trigger)")
+        if cls_is_set:
+            for n in cls_names:
+                set_by.append(f"{n} (Apex Class)")
+        if flow_is_set:
+            for n in flow_names:
+                set_by.append(f"{n} (Flow)")
+        if wf_is_set:
+            for n in wf_names:
+                set_by.append(f"{n} (Workflow Field Update)")
+        is_set_str = f"Y — {'; '.join(set_by)}" if set_by else "N"
+
+        rows.append({
+            "Field Label":                      meta["label"],
+            "Field API Name":                   api_name,
+            "Data Type":                        meta["dataType"],
+            "Field Values":                     meta["fieldValues"],
+            "Behavior":                         meta["behavior"],
+            "Standard or Custom":               "Custom" if meta["isCustom"] else "Standard",
+            "Has Default Value":                "Yes" if meta["hasDefault"] else "No",
+            "Is Formula Field":                 "Yes" if meta["isFormula"] else "No",
+            "Is Encrypted":                     "Yes" if meta["isEncrypted"] else "No",
+            "Available for Reporting":          "Yes" if meta["isReportable"] else "No",
+            "Population Rate":                  meta["popRate"],
+            "Field Created Date":               meta["createdDate"],
+            "Field Last Modified Date":         meta["modifiedDate"],
+            "Workflow Rule Dependencies":       "; ".join(wf_names),
+            "Is used in Trigger (Y/N)":         _yesno(trig_names),
+            "Trigger Name":                     "; ".join(trig_names),
+            "Trigger Logic / Criteria":         "\n".join(trig_notes),
+            "Is used in Apex Class (Y/N)":      _yesno(cls_names),
+            "Apex Class Name":                  "; ".join(cls_names),
+            "Apex Class Logic / Notes":         "\n".join(cls_notes),
+            "Is used in Flow (Y/N)":            _yesno(flow_names),
+            "Flow Name":                        "; ".join(flow_names),
+            "Flow Criteria / Entry Conditions": "\n".join(flow_notes),
+            "Is used in Validation Rule (Y/N)": _yesno(vr_names),
+            "Validation Rule Name":             "; ".join(vr_names),
+            "Validation Logic":                 "\n".join(vr_formulas),
+            "Is Set by Automation (Y/N)":       is_set_str,
+        })
+
+    return rows
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 8 — EXCEL WRITER
+# ─────────────────────────────────────────────────────────────────────────────
+
+WIDE_COLS = {
+    "Field Values",
+    "Trigger Logic / Criteria",
+    "Apex Class Logic / Notes",
+    "Flow Criteria / Entry Conditions",
+    "Validation Logic",
+    "Is Set by Automation (Y/N)",
+    "Workflow Rule Dependencies",
+}
+
+
+def write_excel(rows):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = OBJECT_NAME[:31]
+
+    # Header row
+    ws.append(HEADERS)
+    for col_idx in range(1, len(HEADERS) + 1):
+        cell           = ws.cell(row=1, column=col_idx)
+        cell.fill      = HEADER_FILL
+        cell.font      = HEADER_FONT
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    ws.row_dimensions[1].height = 30
+
+    # Data rows
+    for row_idx, row in enumerate(rows, start=2):
+        fill = ALT_FILL if row_idx % 2 == 0 else None
+        for col_idx, header in enumerate(HEADERS, start=1):
+            val  = row.get(header, "") or ""
+            cell = ws.cell(row=row_idx, column=col_idx, value=val)
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+            if fill:
+                cell.fill = fill
+
+    # Column widths
+    for col_idx, header in enumerate(HEADERS, start=1):
+        if header in WIDE_COLS:
+            ws.column_dimensions[get_column_letter(col_idx)].width = 55
+        else:
+            max_len = len(header)
+            for row in rows:
+                val        = str(row.get(header, "") or "")
+                first_line = val.split("\n")[0]
+                max_len    = max(max_len, min(len(first_line), 60))
+            ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 4, 50)
+
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+
+    out_dir = os.path.dirname(OUTPUT_XLSX)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    wb.save(OUTPUT_XLSX)
+    print(f"\nExcel saved: {OUTPUT_XLSX}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 9 — MAIN
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main():
+    print(f"\n{'=' * 60}")
+    print(f"  SObject Automation Audit")
+    print(f"  Object : {OBJECT_NAME}")
+    print(f"  Org    : {ORG_ALIAS}")
+    print(f"  Output : {OUTPUT_XLSX}")
+    print(f"  Cache  : {CACHE_DIR}")
+    print(f"{'=' * 60}\n")
+
+    os.makedirs(CACHE_DIR, exist_ok=True)
+
+    # Authenticate
+    print("Authenticating ...")
+    token, inst_url = get_credentials(ORG_ALIAS)
+    print(f"  Instance: {inst_url}\n")
+
+    # 1. Field metadata
+    print(f"[1/5] Field metadata ...")
+    merged_fields, _ = merge_field_metadata()
+    field_api_names  = list(merged_fields.keys())
+    print(f"      {len(field_api_names)} total fields\n")
+
+    # 2. Apex Trigger analysis
+    print(f"[2/6] Apex Trigger analysis ...")
+    trigger_analysis = analyze_triggers(field_api_names, token, inst_url)
+    print(f"      {len(trigger_analysis)} fields referenced in triggers\n")
+
+    # 3. Apex Class analysis
+    print(f"[3/6] Apex Class analysis ...")
+    apex_class_analysis = analyze_apex_classes(field_api_names, token, inst_url)
+    print(f"      {len(apex_class_analysis)} fields referenced in apex classes\n")
+
+    # 4. Flow analysis
+    print(f"[4/6] Flow analysis ...")
+    flow_analysis = analyze_flows(field_api_names, token, inst_url)
+    print(f"      {len(flow_analysis)} fields referenced in flows\n")
+
+    # 5. Validation Rule analysis
+    print(f"[5/6] Validation Rule analysis ...")
+    vr_analysis = analyze_validation_rules(field_api_names, token, inst_url)
+    print(f"      {len(vr_analysis)} fields referenced in validation rules\n")
+
+    # 6. Workflow Field Update analysis
+    print(f"[6/6] Workflow Field Update analysis ...")
+    wf_analysis = fetch_workflow_dependencies()
+    print(f"      {len(wf_analysis)} fields targeted by workflow field updates\n")
+
+    # Build rows & write Excel
+    print("Building output rows ...")
+    rows = build_rows(merged_fields, trigger_analysis, apex_class_analysis, flow_analysis, vr_analysis, wf_analysis)
+
+    print("Writing Excel ...")
+    write_excel(rows)
+
+    # Summary — field-level counts
+    triggered   = sum(1 for r in rows if r["Is used in Trigger (Y/N)"] == "Y")
+    in_classes  = sum(1 for r in rows if r["Is used in Apex Class (Y/N)"] == "Y")
+    flowed      = sum(1 for r in rows if r["Is used in Flow (Y/N)"] == "Y")
+    validated   = sum(1 for r in rows if r["Is used in Validation Rule (Y/N)"] == "Y")
+    set_by_auto = sum(1 for r in rows if r["Is Set by Automation (Y/N)"].startswith("Y"))
+
+    # Summary — object-level automation counts (unique automations touching this object)
+    unique_triggers = set(n for info in trigger_analysis.values()     for n in info.get("trigger_names", []))
+    unique_classes  = set(n for info in apex_class_analysis.values()  for n in info.get("class_names", []))
+    unique_flows    = set(n for info in flow_analysis.values()         for n in info.get("flow_names", []))
+    unique_vrs      = set(vr for r in rows for vr in r["Validation Rule Name"].split("; ") if vr)
+    unique_wfs      = set(n for info in wf_analysis.values()           for n in info.get("wf_names", []))
+
+    print(f"\n{'─' * 60}")
+    print(f"  {'OBJECT-LEVEL':30s}  {'FIELD-LEVEL':>10s}")
+    print(f"  {'─' * 56}")
+    print(f"  {'Total fields':30s}  {len(rows):>10,}")
+    print(f"  {'Apex Triggers':30s}  {len(unique_triggers):>5} triggers  /  {triggered:>4} fields")
+    print(f"  {'Apex Classes':30s}  {len(unique_classes):>5} classes   /  {in_classes:>4} fields")
+    print(f"  {'Flows':30s}  {len(unique_flows):>5} flows     /  {flowed:>4} fields")
+    print(f"  {'Validation Rules (active)':30s}  {len(unique_vrs):>5} VRs       /  {validated:>4} fields")
+    wf_fields = sum(1 for r in rows if r["Workflow Rule Dependencies"])
+    print(f"  {'Workflow Field Updates':30s}  {len(unique_wfs):>5} updates   /  {wf_fields:>4} fields")
+    print(f"  {'─' * 56}")
+    print(f"  {'Fields set by automation':30s}  {set_by_auto:>10,}")
+    print(f"{'─' * 60}")
+
+
+if __name__ == "__main__":
+    main()
